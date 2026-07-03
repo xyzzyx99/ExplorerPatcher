@@ -1,0 +1,205 @@
+# references:
+# https://trstringer.com/github-actions-multiline-strings/
+# https://trstringer.com/github-actions-create-release-upload-artifacts/
+# https://github.com/Speedy37/sws/blob/444c67157a98652c4e7ffd3b6d6bbfb664071926/.github/workflows/msbuild.yml
+# https://stackoverflow.com/questions/58886293/getting-current-branch-and-commit-hash-in-github-action
+
+name: Build x64 AVX2
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Commit, branch, or tag to build. Leave empty for current branch.'
+        required: false
+        default: ''
+      config:
+        description: 'Configuration'
+        required: false
+        default: 'Release'
+
+env:
+  BUILD_CONFIGURATION: ${{ github.event.inputs.config || 'Release' }}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 30
+    steps:
+      - name: Print inputs
+        shell: bash
+        run: |
+          echo "ref: ${GITHUB_EVENT_INPUTS_REF}"
+          echo "config: ${GITHUB_EVENT_INPUTS_CONFIG}"
+          echo "platform: x64/amd64 only"
+        env:
+          GITHUB_EVENT_INPUTS_REF: ${{ github.event.inputs.ref }}
+          GITHUB_EVENT_INPUTS_CONFIG: ${{ github.event.inputs.config }}
+
+      - name: Checkout latest build and submodules
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        if: github.event.inputs.ref == ''
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Checkout specific build and submodules
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        if: github.event.inputs.ref != ''
+        with:
+          ref: ${{ github.event.inputs.ref }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3.0.0
+
+      - name: Declare some variables
+        id: vars
+        shell: bash
+        run: |
+          echo "sha_short=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Force x64-only build graph
+        shell: pwsh
+        run: |
+          @'
+          <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+            <PropertyGroup>
+              <!-- Upstream build.proj uses the misspelled Condiguration property. Keep it intentionally. -->
+              <Condiguration Condition="'$(Condiguration)' == ''">$(Configuration)</Condiguration>
+              <Condiguration Condition="'$(Condiguration)' == ''">Release</Condiguration>
+            </PropertyGroup>
+
+            <ItemGroup>
+              <SubprojectsToBuild Include="ep_starttiledata\ep_starttiledata.slnx" Condition="Exists('ep_starttiledata\ep_starttiledata.slnx')">
+                <Properties>Configuration=$(Condiguration);Platform=x64</Properties>
+              </SubprojectsToBuild>
+
+              <BaseEPsToBuild Include="ExplorerPatcher.sln">
+                <Properties>Configuration=$(Condiguration);Platform=amd64</Properties>
+              </BaseEPsToBuild>
+            </ItemGroup>
+
+            <Target Name="Build">
+              <MSBuild Projects="@(SubprojectsToBuild)" BuildInParallel="true" />
+              <MSBuild Projects="@(BaseEPsToBuild)" BuildInParallel="true" />
+            </Target>
+          </Project>
+          '@ | Set-Content -NoNewline -Encoding UTF8 build.proj
+
+      - name: Force maximum MSVC optimization and AVX2
+        shell: pwsh
+        run: |
+          @'
+          <Project>
+            <ItemDefinitionGroup Condition="'$(Configuration)' == 'Release' and ('$(Platform)' == 'x64' or '$(Platform)' == 'amd64')">
+              <ClCompile>
+                <!-- /O2 /Ob2 /Oi /Ot /Oy /GL /Gy /GF plus explicit /Ob3 /Gw /arch:AVX2. -->
+                <Optimization>MaxSpeed</Optimization>
+                <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
+                <IntrinsicFunctions>true</IntrinsicFunctions>
+                <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
+                <OmitFramePointers>true</OmitFramePointers>
+                <WholeProgramOptimization>true</WholeProgramOptimization>
+                <FunctionLevelLinking>true</FunctionLevelLinking>
+                <StringPooling>true</StringPooling>
+                <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
+                <AdditionalOptions>%(AdditionalOptions) /Ob3 /Gw /arch:AVX2</AdditionalOptions>
+              </ClCompile>
+
+              <Link>
+                <!-- /LTCG /OPT:REF /OPT:ICF -->
+                <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
+                <OptimizeReferences>true</OptimizeReferences>
+                <EnableCOMDATFolding>true</EnableCOMDATFolding>
+                <AdditionalOptions>%(AdditionalOptions) /LTCG</AdditionalOptions>
+              </Link>
+            </ItemDefinitionGroup>
+          </Project>
+          '@ | Set-Content -NoNewline -Encoding UTF8 Directory.Build.targets
+
+      - name: Enable SimpleWindowSwitcher support for newer Windows SDKs
+        shell: cmd
+        run: |
+          cd libs/sws
+          C:\msys64\usr\bin\wget.exe https://github.com/valinet/sws/commit/972acb76d1e6429133c92ed7cdefd29b9a2c6179.patch
+          C:\msys64\usr\bin\dos2unix.exe 972acb76d1e6429133c92ed7cdefd29b9a2c6179.patch
+          C:\msys64\usr\bin\dos2unix.exe SimpleWindowSwitcher/sws_def.h
+          C:\msys64\usr\bin\patch.exe -N SimpleWindowSwitcher/sws_def.h 972acb76d1e6429133c92ed7cdefd29b9a2c6179.patch
+          C:\msys64\usr\bin\unix2dos.exe SimpleWindowSwitcher/sws_def.h
+          exit /b 0
+
+      - name: Setup NuGet
+        uses: nuget/setup-nuget@fd55a6f3b34392fa83fde1454582407d8c714123 # v4.0
+        with:
+          nuget-version: '7.x'
+
+      - name: Restore NuGet packages
+        run: |
+          nuget restore ExplorerPatcher.sln
+          nuget restore ep_starttiledata/ep_starttiledata.slnx
+
+      - name: Build dependencies (Debug)
+        if: env.BUILD_CONFIGURATION == 'Debug'
+        shell: cmd
+        run: BuildDependenciesDebug.bat
+
+      - name: Build dependencies (Release)
+        if: env.BUILD_CONFIGURATION == 'Release'
+        shell: cmd
+        run: BuildDependenciesRelease.bat
+
+      - name: Download ep_taskbar x64
+        uses: robinraju/release-downloader@28fc21f50d76778e7023361aa1f863e717d3d56f # v1.13
+        with:
+          repository: ExplorerPatcher/ep_taskbar_releases
+          fileName: ep_taskbar.*.amd64.dll
+          latest: true
+          out-file-path: build/Release
+
+      # build/Release/ep_taskbar.*.amd64.dll -> build/Release/x64/ep_taskbar.*.dll
+      - name: Move ep_taskbar x64
+        shell: bash
+        run: |
+          if ls build/Release/ep_taskbar.*.amd64.dll 1> /dev/null 2>&1; then
+            mkdir -p build/Release/x64
+            for file in build/Release/ep_taskbar.*.amd64.dll; do
+              mv "$file" "build/Release/x64/$(basename "$file" .amd64.dll).dll"
+            done
+          fi
+
+      - name: Build ExplorerPatcher x64 AVX2
+        working-directory: ${{env.GITHUB_WORKSPACE}}
+        run: |
+          msbuild /m build.proj /p:Configuration=${{env.BUILD_CONFIGURATION}} /p:Condiguration=${{env.BUILD_CONFIGURATION}} /p:Platform=amd64 /p:PreferredToolArchitecture=x64
+
+      - name: Generate dxgi.dll x64
+        shell: bash
+        run: |
+          if [[ -f "build/Release/x64/ExplorerPatcher.amd64.dll" ]]; then cp build/Release/x64/ExplorerPatcher.amd64.dll build/Release/x64/dxgi.dll; fi
+
+      - name: Patch amd64 setup
+        shell: cmd
+        run: |
+          if exist "build\Release\x64\ExplorerPatcher.amd64.dll" (
+            "build\Release\x64\ep_setup_patch.exe" "build\Release\x64\ExplorerPatcher.amd64.dll" "build\Release\x64\ep_setup.exe"
+          )
+          exit /b 0
+
+      - name: Delete intermediate files x64
+        shell: bash
+        run: |
+          rm -rf build/Release/x64/ep_setup_files
+          rm -f build/Release/x64/ep_setup_files.zip.bin
+
+      - name: Upload x64 artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ep_bin_x64_avx2_${{ steps.vars.outputs.sha_short }}_${{ github.ref_name }}
+          path: |
+            build/Release/x64/
+          if-no-files-found: error
